@@ -24,8 +24,10 @@ import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.codec.http.DefaultLastHttpContent;
 import io.netty.handler.codec.http.HttpServerCodec;
 import io.netty.handler.logging.LoggingHandler;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
 import rx.Subscriber;
 import rxweb.Server;
 import rxweb.http.Method;
@@ -51,33 +53,31 @@ import java.util.concurrent.atomic.AtomicReference;
  * @author Sebastien Deleuze
  */
 public class NettyServer implements Server {
-
+    
     protected final ServerBootstrap bootstrap;
-
+    
     protected enum ServerState {Created, Starting, Started, Shutdown}
-
-    ;
+    
     private final HandlerResolver handlerResolver = new DefaultHandlerResolver();
     protected final AtomicReference<ServerState> serverStateRef;
     protected int port = 9090;
     private ChannelFuture bindFuture;
-
-
+    
+    
     public NettyServer() {
         this.serverStateRef = new AtomicReference<ServerState>(ServerState.Created);
         this.bootstrap = new ServerBootstrap();
         init();
     }
-
+    
     public NettyServer(String host, int port) {
         this();
         this.port = port;
         init();
     }
-
+    
     private void init() {
-        this.bootstrap
-                .option(ChannelOption.SO_KEEPALIVE, true)
+        this.bootstrap.option(ChannelOption.SO_KEEPALIVE, true)
                 .childOption(ChannelOption.SO_KEEPALIVE, true)
                 .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
                 .group(new NioEventLoopGroup())
@@ -85,111 +85,114 @@ public class NettyServer implements Server {
                 .childHandler(new ChannelInitializer<Channel>() {
                     @Override
                     protected void initChannel(Channel ch) throws Exception {
-                        ch.pipeline().addLast(new LoggingHandler()).addLast(new HttpServerCodec()).addLast(new NettyServerCodecHandlerAdapter()).addLast(new ChannelInboundHandlerAdapter() {
-                            private CompletableFuture<Channel> headersSent;
-                            private final Logger logger = LoggerFactory.getLogger(getClass());
-
-                            @Override
-                            public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-                                if (msg instanceof ServerRequest) {
-                                    handleRequest(ctx, (ServerRequest) msg);
-                                } else {
-                                    super.channelRead(ctx, msg);
-                                }
-                            }
-
-                            private void handleRequest(ChannelHandlerContext ctx, ServerRequest request) {
-                                List<ServerHandler> handlers = handlerResolver.resolve(request);
-                                if (handlers.isEmpty()) {
-                                    this.logger.info("No handler found for request " +
-                                            request.getUri());
-                                }
-                                // In order to keep simple, we take the first handler
-                                ServerHandler handler = handlers.get(0);
-                                ServerResponse response = new NettyServerResponseAdapter(request);
-                                handler.handle(request, response);
-
-                                response.getContent().subscribe(new Subscriber<ByteBuffer>() {
+                        ch.pipeline()
+                                .addLast(new LoggingHandler())
+                                .addLast(new HttpServerCodec())
+                                .addLast(new NettyServerCodecHandlerAdapter())
+                                .addLast(new ChannelInboundHandlerAdapter() {
+                                    private CompletableFuture<Channel> headersSent;
+                                    private final Logger logger = LoggerFactory.getLogger(getClass());
+                                    
                                     @Override
-                                    public void onNext(ByteBuffer buffer) {
-                                        if (headersSent != null) {
-                                            ctx.writeAndFlush(buffer);
+                                    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+                                        if (msg instanceof ServerRequest) {
+                                            handleRequest(ctx, (ServerRequest) msg);
                                         } else {
-                                            headersSent = CompletableFutureUtils.fromChannelFuture(ctx.write(response));
-
-                                            headersSent.handle((channel, t) -> {
-                                                if (channel != null) {
-                                                    response.setStatusAndHeadersSent(true);
-                                                    ctx.write(buffer);
+                                            super.channelRead(ctx, msg);
+                                        }
+                                    }
+                                    
+                                    private void handleRequest(ChannelHandlerContext ctx, ServerRequest request) {
+                                        List<ServerHandler> handlers = handlerResolver.resolve(request);
+                                        if (handlers.isEmpty()) {
+                                            this.logger.info("No handler found for request " + request.getUri());
+                                        }
+                                        // In order to keep simple, we take the first handler
+                                        ServerHandler handler = handlers.get(0);
+                                        ServerResponse response = new NettyServerResponseAdapter(request);
+                                        handler.handle(request, response);
+                                        
+                                        response.getContent().subscribe(new Subscriber<ByteBuffer>() {
+                                            @Override
+                                            public void onNext(ByteBuffer buffer) {
+                                                if (headersSent != null) {
+                                                    ctx.writeAndFlush(buffer);
                                                 } else {
-                                                    logger.error(t.toString());
+                                                    headersSent = CompletableFutureUtils.fromChannelFuture(ctx.write(response));
+                                                    
+                                                    headersSent.handle((channel, t) -> {
+                                                        if (channel != null) {
+                                                            response.setStatusAndHeadersSent(true);
+                                                            ctx.write(buffer);
+                                                        } else {
+                                                            logger.error(t.toString());
+                                                        }
+                                                        return channel;
+                                                    });
                                                 }
-                                                return channel;
-                                            });
-                                        }
+                                            }
+                                            
+                                            @Override
+                                            public void onError(Throwable e) {
+                                                logger.error("Error in response content observable: " + e);
+                                            }
+                                            
+                                            @Override
+                                            public void onCompleted() {
+                                                if (response.isStatusAndHeadersSent()) {
+                                                    ctx.write(new DefaultLastHttpContent());
+                                                    ctx.flush();
+                                                    ctx.close();
+                                                } else if (headersSent != null) {
+                                                    headersSent.thenRun(() -> {
+                                                        ctx.write(new DefaultLastHttpContent());
+                                                        ctx.flush();
+                                                        ctx.close();
+                                                    });
+                                                } else {
+                                                    CompletableFutureUtils.fromChannelFuture(ctx.write(response)).thenRun(() -> {
+                                                        response.setStatusAndHeadersSent(true);
+                                                        ctx.write(new DefaultLastHttpContent());
+                                                        ctx.flush();
+                                                        ctx.close();
+                                                    });
+                                                }
+                                            }
+                                            
+                                        });
                                     }
-
-                                    @Override
-                                    public void onError(Throwable e) {
-                                        logger.error("Error in response content observable: " + e);
-                                    }
-
-                                    @Override
-                                    public void onCompleted() {
-                                        if (response.isStatusAndHeadersSent()) {
-                                            ctx.write(new DefaultLastHttpContent());
-                                            ctx.flush();
-                                            ctx.close();
-                                        } else if (headersSent != null) {
-                                            headersSent.thenRun(() -> {
-                                                ctx.write(new DefaultLastHttpContent());
-                                                ctx.flush();
-                                                ctx.close();
-                                            });
-                                        } else {
-                                            CompletableFutureUtils.fromChannelFuture(ctx.write(response)).thenRun(() -> {
-                                                response.setStatusAndHeadersSent(true);
-                                                ctx.write(new DefaultLastHttpContent());
-                                                ctx.flush();
-                                                ctx.close();
-                                            });
-                                        }
-                                    }
-
+                                    
                                 });
-                            }
-
-                        });
                     }
                 });
     }
-
-
+    
+    
     @Override
     public void addHandler(final Condition<Request> condition, final ServerHandler handler) {
         this.handlerResolver.addHandler(condition, handler);
     }
-
+    
     @Override
     public void get(final String path, final ServerHandler handler) {
         addHandler(MappingCondition.Builder.from(path).method(Method.GET).build(), handler);
     }
-
+    
     @Override
     public void post(final String path, final ServerHandler handler) {
         addHandler(MappingCondition.Builder.from(path).method(Method.POST).build(), handler);
     }
-
+    
     @Override
     public void put(final String path, final ServerHandler handler) {
         addHandler(MappingCondition.Builder.from(path).method(Method.PUT).build(), handler);
     }
-
+    
     @Override
     public void delete(final String path, final ServerHandler handler) {
         addHandler(MappingCondition.Builder.from(path).method(Method.DELETE).build(), handler);
     }
-
+    
     @Override
     public CompletableFuture<Void> start() {
         if (!serverStateRef.compareAndSet(ServerState.Created, ServerState.Starting)) {
@@ -205,10 +208,10 @@ public class NettyServer implements Server {
             }
         });
         return CompletableFutureUtils.fromChannelFuture(this.bindFuture).thenRun(() -> {
-
+        
         });
     }
-
+    
     @Override
     public CompletableFuture<Void> stop() {
         if (!serverStateRef.compareAndSet(ServerState.Started, ServerState.Shutdown)) {
@@ -216,11 +219,11 @@ public class NettyServer implements Server {
         }
         ChannelFuture closeFuture = this.bindFuture.channel().close();
         return CompletableFutureUtils.fromChannelFuture(closeFuture).thenRun(() -> {
-
+        
         });
-
+        
     }
-
+    
     public static void main(String[] args) {
         Server server = new NettyServer();
         try {
